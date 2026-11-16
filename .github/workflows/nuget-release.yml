@@ -203,11 +203,9 @@ jobs:
         env:
           FEED: ${{ inputs.feed }}
           API_KEY: ${{ github.token }}
-        run: |
-          dotnet nuget push "$PACK_DIR/*.nupkg" --source "$FEED" --api-key "$API_KEY" --skip-duplicate
-          if compgen -G "$PACK_DIR/*.snupkg" > /dev/null; then
-            dotnet nuget push "$PACK_DIR/*.snupkg" --source "$FEED" --api-key "$API_KEY" --skip-duplicate
-          fi
+        # GitHub Packages rejects symbol packages: push .nupkg only (--no-symbols stops the automatic
+        # .snupkg push). Symbol packages still ship as GitHub Release assets below.
+        run: dotnet nuget push "$PACK_DIR/*.nupkg" --source "$FEED" --api-key "$API_KEY" --skip-duplicate --no-symbols
 
       - name: Create GitHub release
         if: '!inputs.dry-run'
