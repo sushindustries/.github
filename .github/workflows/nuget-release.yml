@@ -1,0 +1,221 @@
+# Reusable workflow: build, test, pack and publish NuGet packages to GitHub Packages from a release tag,
+# then create a GitHub release with the packages attached.
+# The package version comes from the tag, never from the project files: vX.Y.Z releases the whole repo,
+# <family>/vX.Y.Z releases one folder under `families-root`. A tag with a `-label` suffix is a prerelease.
+# The scripts live in scripts/nuget-release/ of this repo and are checked out into .release-tooling.
+# dry-run builds, tests, packs and verifies, lists the packages in the job summary, and publishes nothing.
+#
+# Caller example: see README.md in this repo.
+name: nuget-release
+
+on:
+  workflow_call:
+    inputs:
+      tag:
+        description: 'Release tag, vX.Y.Z or <family>/vX.Y.Z. Empty uses github.ref_name; set it for workflow_dispatch dry runs.'
+        required: false
+        type: string
+        default: ''
+      families-root:
+        description: Folder that holds one sub-folder per package family (used for <family>/vX.Y.Z tags)
+        required: false
+        type: string
+        default: packages
+      exclude-families:
+        description: Comma-separated families this repo must never release (passed to tag-meta.sh)
+        required: false
+        type: string
+        default: ''
+      pack-target:
+        description: 'Solution or project to build, test and pack, relative to the release folder. Empty picks it with scripts/nuget-release/pack-target.sh.'
+        required: false
+        type: string
+        default: ''
+      test-command:
+        description: Test command, run in the release folder after the build. Empty skips tests.
+        required: false
+        type: string
+        default: dotnet test -c Release --no-build
+      require-green-ci:
+        description: Fail unless every check run on the tagged commit that does not match ci-ignore is green (ci-green.sh)
+        required: false
+        type: boolean
+        default: false
+      ci-ignore:
+        description: Regex of check run names that require-green-ci ignores (this workflow's own job, flaky external checks)
+        required: false
+        type: string
+        default: '^(release|SonarCloud)'
+      dry-run:
+        description: Build, test, pack and verify, list the packages in the job summary, but do not push or create a release
+        required: false
+        type: boolean
+        default: false
+      node-version:
+        description: Node.js version for setup-node. Empty means Node.js is not set up.
+        required: false
+        type: string
+        default: ''
+      pnpm-version:
+        description: pnpm version for pnpm/action-setup. Empty means pnpm is not set up.
+        required: false
+        type: string
+        default: ''
+      runs-on:
+        description: Runner label
+        required: false
+        type: string
+        default: ubuntu-latest
+      feed:
+        description: NuGet feed (source) URL the packages are pushed to
+        required: false
+        type: string
+        default: https://nuget.pkg.github.com/sushindustries/index.json
+      tooling-ref:
+        description: Ref of sushindustries/.github whose scripts are used
+        required: false
+        type: string
+        default: main
+
+permissions: {}
+
+jobs:
+  release:
+    name: release
+    runs-on: ${{ inputs.runs-on }}
+    permissions:
+      contents: write
+      packages: write
+      checks: read
+    env:
+      TOOLS: .release-tooling/scripts/nuget-release
+      RELEASE_TAG: ${{ inputs.tag != '' && inputs.tag || github.ref_name }}
+    steps:
+      - name: Checkout caller
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Checkout release tooling
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: sushindustries/.github
+          ref: ${{ inputs.tooling-ref }}
+          path: .release-tooling
+          persist-credentials: false
+
+      - name: Set package output folder
+        run: echo "PACK_DIR=$RUNNER_TEMP/nupkg" >> "$GITHUB_ENV"
+
+      - name: Tag metadata
+        id: meta
+        env:
+          REPO_ROOT: .
+          FAMILIES_ROOT: ${{ inputs.families-root }}
+          EXCLUDE_FAMILIES: ${{ inputs.exclude-families }}
+        run: bash "$TOOLS/tag-meta.sh" "$RELEASE_TAG" "$FAMILIES_ROOT" "$EXCLUDE_FAMILIES" >> "$GITHUB_OUTPUT"
+
+      - name: Require green CI on the tagged commit
+        if: inputs.require-green-ci
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          CI_IGNORE: ${{ inputs.ci-ignore }}
+        run: bash "$TOOLS/ci-green.sh" "$REPOSITORY" "$(git rev-parse HEAD)" "$CI_IGNORE"
+
+      - name: Resolve build inputs
+        id: build
+        env:
+          DIR: ${{ steps.meta.outputs.dir }}
+          PACK_TARGET: ${{ inputs.pack-target }}
+        run: |
+          if [ -f "$DIR/global.json" ]; then
+            echo "global-json=$DIR/global.json" >> "$GITHUB_OUTPUT"
+          else
+            echo "global-json=global.json" >> "$GITHUB_OUTPUT"
+          fi
+          if [ -n "$PACK_TARGET" ]; then
+            echo "target=$PACK_TARGET" >> "$GITHUB_OUTPUT"
+          else
+            echo "target=$(bash "$TOOLS/pack-target.sh" "$DIR")" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Set up .NET
+        uses: actions/setup-dotnet@0f4a354dd5547a28c70b7853dbd95d5b67886e73 # v6.1.0
+        with:
+          global-json-file: ${{ steps.build.outputs.global-json }}
+
+      - name: Set up pnpm
+        if: inputs.pnpm-version != ''
+        uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
+        with:
+          version: ${{ inputs.pnpm-version }}
+
+      - name: Set up Node.js
+        if: inputs.node-version != ''
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ inputs.node-version }}
+
+      - name: Build
+        working-directory: ${{ steps.meta.outputs.dir }}
+        env:
+          TARGET: ${{ steps.build.outputs.target }}
+          V: ${{ steps.meta.outputs.version }}
+        run: dotnet build "$TARGET" -c Release "-p:Version=$V" "-p:MinVerVersionOverride=$V"
+
+      - name: Test
+        if: inputs.test-command != ''
+        working-directory: ${{ steps.meta.outputs.dir }}
+        env:
+          TEST_COMMAND: ${{ inputs.test-command }}
+        run: bash -c "$TEST_COMMAND"
+
+      - name: Pack
+        working-directory: ${{ steps.meta.outputs.dir }}
+        env:
+          TARGET: ${{ steps.build.outputs.target }}
+          V: ${{ steps.meta.outputs.version }}
+        run: dotnet pack "$TARGET" -c Release --no-build "-p:Version=$V" "-p:MinVerVersionOverride=$V" -o "$PACK_DIR"
+
+      - name: Verify packages
+        env:
+          V: ${{ steps.meta.outputs.version }}
+        run: bash "$TOOLS/verify-packages.sh" "$PACK_DIR" "$V"
+
+      - name: Package summary
+        env:
+          V: ${{ steps.meta.outputs.version }}
+          DRY_RUN: ${{ inputs.dry-run }}
+        run: |
+          {
+            echo "### NuGet release $RELEASE_TAG (version $V)"
+            if [ "$DRY_RUN" = true ]; then echo "Dry run: nothing was pushed or released."; fi
+            echo
+            for f in "$PACK_DIR"/*; do
+              [ -e "$f" ] && echo "- \`$(basename "$f")\`"
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Push packages
+        if: '!inputs.dry-run'
+        env:
+          FEED: ${{ inputs.feed }}
+          API_KEY: ${{ github.token }}
+        # GitHub Packages rejects symbol packages: push .nupkg only (--no-symbols stops the automatic
+        # .snupkg push). Symbol packages still ship as GitHub Release assets below.
+        run: dotnet nuget push "$PACK_DIR/*.nupkg" --source "$FEED" --api-key "$API_KEY" --skip-duplicate --no-symbols
+
+      - name: Create GitHub release
+        if: '!inputs.dry-run'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PREFIX: ${{ steps.meta.outputs.tag_prefix }}
+          PRERELEASE: ${{ steps.meta.outputs.prerelease }}
+        run: |
+          args=(--verify-tag --title "$RELEASE_TAG" --generate-notes)
+          prev="$(bash "$TOOLS/prev-tag.sh" "$RELEASE_TAG" "$PREFIX")"
+          if [ -n "$prev" ]; then args+=(--notes-start-tag "$prev"); fi
+          if [ "$PRERELEASE" = true ]; then args+=(--prerelease); fi
+          gh release create "$RELEASE_TAG" "$PACK_DIR"/* "${args[@]}"
